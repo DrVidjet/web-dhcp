@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+# dhcp-script для dnsmasq: запоминает данные клиента (vendor class, когда впервые/последний раз) для web-dhcp.
+# Каталог - DASH_HOSTS_DIR из .env рядом со скриптом (старое имя - config.env).
+import json, os, sys, time
+if len(sys.argv) < 4 or sys.argv[1] not in ("add", "old", "del"):
+    sys.exit(0)
+action, mac, ip = sys.argv[1:4]
+d = "/var/lib/web-dhcp/hosts"
+for name in (".env", "config.env"):
+    try:
+        with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), name), encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k.strip() == "DASH_HOSTS_DIR" and v.strip():
+                    d = v.strip()
+        break
+    except OSError:
+        continue
+os.makedirs(d, exist_ok=True)
+path = os.path.join(d, mac.replace(":", "") + ".json")
+try:
+    with open(path) as f:
+        h = json.load(f)
+except Exception:
+    h = {"mac": mac, "first_seen": int(time.time())}
+e = os.environ
+h.update(ip=ip, last_seen=int(time.time()), last_action=action)
+if len(sys.argv) > 4 and sys.argv[4]:
+    h["hostname"] = sys.argv[4]
+for k, v in (("vendor_class", "DNSMASQ_VENDOR_CLASS"), ("supplied_hostname", "DNSMASQ_SUPPLIED_HOSTNAME"),
+             ("client_id", "DNSMASQ_CLIENT_ID")):
+    if e.get(v):
+        h[k] = e[v]
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(h, f)
+os.replace(tmp, path)
