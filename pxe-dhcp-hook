@@ -31,6 +31,10 @@ for k, v in (("vendor_class", "DNSMASQ_VENDOR_CLASS"), ("supplied_hostname", "DN
              ("client_id", "DNSMASQ_CLIENT_ID")):
     if e.get(v):
         h[k] = e[v]
+# Настоящий запрос клиента (не перечитывание файла аренд при старте dnsmasq и не del): без vendor class -
+# стираем старый, иначе после загрузки по PXE машина в ОС так и числилась бы «PXE boot».
+if action != "del" and (e.get("DNSMASQ_TAGS") or e.get("DNSMASQ_REQUESTED_OPTIONS")) and not e.get("DNSMASQ_VENDOR_CLASS"):
+    h.pop("vendor_class", None)
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(h, f)

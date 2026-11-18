@@ -206,10 +206,8 @@ def collect():
             kind = "BMC / IPMI"
         elif vc.startswith("PXEClient"):
             kind = "PXE boot"
-        elif vc:
-            kind = "OS"
         else:
-            kind = ""
+            kind = "OS"  # DHCP-клиент без PXEClient (PXE-загрузчик всегда его шлёт)
         rows.append({
             "mac": mac, "label": labels.get(mac, ""), "ip": ip, "kind": kind, "vendor_class": vc,
             "hostname": l.get("hostname") or h.get("hostname") or h.get("supplied_hostname", ""),

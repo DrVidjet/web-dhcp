@@ -45,6 +45,7 @@ read_kv() {         # read_kv файл -> PRE[...] (не перетирает у
     k=${line%%=*}; v=${line#*=}; k=${k//[[:space:]]/}
     [ -n "$k" ] && [ -z "${PRE[$k]+x}" ] && PRE[$k]=$v
   done < "$1"
+  return 0  # иначе set -e роняет скрипт, если ключ последней строки уже задан
 }
 read_proj() {
   local f=$SRC/.env k v
@@ -55,6 +56,7 @@ read_proj() {
     k=${line%%=*}; v=${line#*=}; k=${k//[[:space:]]/}
     [ -n "$k" ] && [ -n "$v" ] && PROJ[$k]=$v
   done < "$f"
+  return 0
 }
 read_proj
 # setting ПЕРЕМЕННАЯ "по умолчанию" - без вопроса (редкие настройки: только из --answers / .env)
@@ -264,6 +266,8 @@ rm -f "$INSTALL_DIR/config.env"
 echo "настройки: $cfg"
 
 # ---------------------------------------------------------------- сеть и dnsmasq
+# хук и при продлении аренды (dnsmasq >= 2.84), иначе тип клиента и «последний запрос» не обновляются
+dnsmasq_renewal() { dnsmasq --help 2>/dev/null | grep script-on-renewal >/dev/null; }
 if [ "$INSTALL_DHCP" = y ]; then
   say "DHCP на $DASH_IFACE"
   if [ -n "$INSTALL_DHCP_ADDR" ] && [ -z "$(iface_cidr "$DASH_IFACE")" ]; then
@@ -303,6 +307,7 @@ if [ "$INSTALL_DHCP" = y ]; then
     [ -n "$INSTALL_DHCP_DNS" ] && echo "dhcp-option=option:dns-server,$INSTALL_DHCP_DNS"
     echo "dhcp-leasefile=$DASH_LEASES"
     echo "dhcp-script=$INSTALL_DIR/pxe-dhcp-hook"
+    dnsmasq_renewal && echo "script-on-renewal"
     if [ "$INSTALL_DHCP_PXE" = y ]; then
       echo "# PXE-клиентам - опция 60 «PXEClient»: загрузчик спросит proxyDHCP (порт 4011) на этом же сервере"
       echo "dhcp-vendorclass=set:pxe,PXEClient"
@@ -322,10 +327,14 @@ else
     cur=$(grep -rhsE '^[[:space:]]*dhcp-script[[:space:]]*=' /etc/dnsmasq.conf /etc/dnsmasq.d/ | head -1 | cut -d= -f2- | xargs || true)
     if [ "$cur" = "$INSTALL_DIR/pxe-dhcp-hook" ]; then
       echo "хук уже подключён к dnsmasq"
+      if dnsmasq_renewal && ! grep -rqsE '^[[:space:]]*script-on-renewal' /etc/dnsmasq.conf /etc/dnsmasq.d/; then
+        echo "script-on-renewal" > "$HOOKCONF"
+        systemctl restart dnsmasq && echo "хук будет вызываться и при продлении аренды: $HOOKCONF"
+      fi
     elif [ -n "$cur" ]; then
       warn "в dnsmasq уже другой dhcp-script ($cur) - история клиентов (vendor class, «впервые») заполняться не будет"
     else
-      echo "dhcp-script=$INSTALL_DIR/pxe-dhcp-hook" > "$HOOKCONF"
+      { echo "dhcp-script=$INSTALL_DIR/pxe-dhcp-hook"; if dnsmasq_renewal; then echo "script-on-renewal"; fi; } > "$HOOKCONF"
       systemctl restart dnsmasq && echo "хук подключён: $HOOKCONF"
     fi
   else
