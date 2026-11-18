@@ -7,8 +7,10 @@
 """
 import html
 import json
+import logging
 import os
 import socket
+import sys
 import threading
 import time
 import urllib.parse
@@ -38,7 +40,29 @@ def load_conf():
     return conf
 
 
+def setup_logging(level):
+    """Уровень: ERROR / WARNING / INFO / DEBUG. Вывод - stderr (systemd пишет его в файл лога или журнал);
+    в журнал - без времени, его journald ставит сам."""
+    lvl = logging.getLevelName(str(level).strip().upper())
+    fmt = "%(levelname)s %(message)s" if os.environ.get("JOURNAL_STREAM") else "%(asctime)s %(levelname)s %(message)s"
+    logging.basicConfig(level=lvl if isinstance(lvl, int) else logging.INFO, format=fmt, datefmt="%Y-%m-%d %H:%M:%S")
+    if not isinstance(lvl, int):
+        logging.warning("DASH_LOG_LEVEL=%s - нет такого уровня (ERROR/WARNING/INFO/DEBUG), взят INFO", level)
+
+
 C = load_conf()
+setup_logging(C.get("DASH_LOG_LEVEL", "INFO"))
+log = logging.getLogger("pxe-dash")
+_warned = set()
+
+
+def warn_once(key, msg, *args):
+    """Предупреждение один раз на ключ (иначе - при каждом обновлении страницы)."""
+    if key not in _warned:
+        _warned.add(key)
+        log.warning(msg, *args)
+
+
 LISTEN = (C.get("DASH_BIND", "0.0.0.0"), int(C.get("DASH_PORT", "8080")))
 IFACE = C.get("DASH_IFACE", "")                      # интерфейс DHCP-сети: по его ARP-таблице - «в сети»
 LEASES = C.get("DASH_LEASES", "/var/lib/misc/dnsmasq.leases")
@@ -61,7 +85,10 @@ def read_labels():
     try:
         with open(LABELS) as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as ex:
+        warn_once("labels", "подписи не прочитать (%s): %s", LABELS, ex)
         return {}
 
 
@@ -72,6 +99,7 @@ def set_label(mac, text):
     text = " ".join(str(text).split())[:100]
     with labels_lock:
         d = read_labels()
+        old = d.get(mac, "")
         if text:
             d[mac] = text
         else:
@@ -80,6 +108,8 @@ def set_label(mac, text):
         with open(tmp, "w") as f:
             json.dump(d, f, ensure_ascii=False, indent=1)
         os.replace(tmp, LABELS)
+    if text != old:
+        return old
 
 # IPMI v1.5 Get Channel Authentication Capabilities (what "ipmitool ping" style tools send)
 IPMI_PROBE = bytes.fromhex("0600ff07000000000000000000092018c88100388e04b5")
@@ -101,14 +131,15 @@ def load_oui():
                 k, _, name = line.rstrip("\n").partition("\t")
                 low = name.lower()
                 oui[k.lower()] = next((v for p, v in SHORT if low.startswith(p)), name.strip())
-    except OSError:
-        pass
+    except OSError as ex:
+        log.warning("база производителей не прочитана (%s): %s", OUI_FILE, ex)
     return oui
 
 
 OUI = load_oui()
 
 ipmi_cache = {}  # ip -> (is_bmc, checked_at)
+iv_state = {"ok": None}  # iVentoy отвечал ли в прошлый раз - пишем в лог только перемены
 lock = threading.Lock()
 
 
@@ -159,7 +190,8 @@ def read_hosts():
             with open(os.path.join(HOSTS_DIR, n)) as f:
                 h = json.load(f)
             hosts[h["mac"].lower()] = h
-        except Exception:
+        except Exception as ex:
+            warn_once("host:" + n, "история клиента %s не прочитана: %s", os.path.join(HOSTS_DIR, n), ex)
             continue
     return hosts
 
@@ -179,14 +211,20 @@ def read_arp():
 
 
 def iventoy_status():
-    out = {}
+    out, err = {}, None
     for m in ("query_status", "get_dhcp_mode"):
         try:
             req = urllib.request.Request(IVENTOY_API, data=json.dumps({"method": m}).encode(),
                                          headers={"Content-Type": "application/json"})
             out.update(json.load(urllib.request.urlopen(req, timeout=2)))
-        except Exception:
-            pass
+        except Exception as ex:
+            err = ex
+    if (err is None) != iv_state["ok"]:
+        if err is None:
+            log.info("iVentoy (%s) отвечает", IVENTOY_API)
+        else:
+            log.warning("iVentoy (%s) не отвечает: %s", IVENTOY_API, err)
+        iv_state["ok"] = err is None
     return out
 
 
@@ -225,10 +263,19 @@ def collect():
 def prober():
     while True:
         ips = {r["ip"] for r in collect() if r["ip"] and r["lease"] == "active"}
-        for ip in ips:
-            res = probe_ipmi(ip)
-            with lock:
-                ipmi_cache[ip] = (res, time.time())
+        try:
+            for ip in ips:
+                res = probe_ipmi(ip)
+                with lock:
+                    was = ipmi_cache.get(ip, (None, 0))[0]
+                    ipmi_cache[ip] = (res, time.time())
+                if res and not was:
+                    log.info("BMC/IPMI: %s отвечает на UDP 623", ip)
+                elif was and not res:
+                    log.info("BMC/IPMI: %s перестал отвечать на UDP 623", ip)
+            log.debug("опрос IPMI: адресов %d, BMC %d", len(ips), sum(ipmi_cache[ip][0] for ip in ips))
+        except Exception:
+            log.exception("опрос IPMI")
         time.sleep(PROBE_INTERVAL)
 
 
@@ -321,9 +368,21 @@ setInterval(() => {{ if (!editing) location.reload(); }}, 15000);
 DHCP_MODES = {0: "Internal", 1: "External", 2: "ExternalNet", 3: "Proxy", 4: "ProxyNet"}
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # обрыв соединения клиентом - не ошибка
+        ex = sys.exc_info()[1]
+        if isinstance(ex, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            log.debug("%s: соединение оборвано: %s", client_address[0], ex)
+        else:
+            log.exception("%s: ошибка при обработке запроса", client_address[0])
+
+
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *a):
+        log.debug("%s %s", self.client_address[0], fmt % a)
 
     def do_POST(self):
         if self.path != "/api/label":
@@ -334,9 +393,13 @@ class Handler(BaseHTTPRequestHandler):
             if n > 4096:
                 raise ValueError("too big")
             d = json.loads(self.rfile.read(n) or b"{}")
-            set_label(d.get("mac", ""), d.get("label", ""))
+            old = set_label(d.get("mac", ""), d.get("label", ""))
+            if old is not None:
+                log.info("%s: подпись %s: «%s» -> «%s»", self.client_address[0], str(d.get("mac", "")).lower().strip(),
+                         old, " ".join(str(d.get("label", "")).split())[:100])
             code, body = 200, b'{"ok": true}'
         except Exception as ex:
+            log.warning("%s: подпись не сохранена: %s", self.client_address[0], ex)
             code, body = 400, json.dumps({"error": str(ex)}).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -403,5 +466,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    log.info("запуск: %s:%d, интерфейс %s, аренды %s, история %s, уровень лога %s", LISTEN[0], LISTEN[1],
+             IFACE or "все", LEASES, HOSTS_DIR, logging.getLevelName(logging.getLogger().level))
     threading.Thread(target=prober, daemon=True).start()
-    ThreadingHTTPServer(LISTEN, Handler).serve_forever()
+    Server(LISTEN, Handler).serve_forever()

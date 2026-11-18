@@ -6,6 +6,7 @@
 Использование: pxe-dash-prune [--dry-run]
 """
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -34,6 +35,10 @@ def load_conf():
 
 
 C = load_conf()
+_lvl = logging.getLevelName(C.get("DASH_LOG_LEVEL", "INFO").strip().upper())
+logging.basicConfig(level=_lvl if isinstance(_lvl, int) else logging.INFO, datefmt="%Y-%m-%d %H:%M:%S",
+                    format="%(levelname)s %(message)s" if os.environ.get("JOURNAL_STREAM") else "%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("pxe-dash-prune")
 HOSTS_DIR = C.get("DASH_HOSTS_DIR", "/var/lib/web-dhcp/hosts")
 IFACE = C.get("DASH_IFACE", "")
 ARP_FILE = C.get("DASH_ARP_FILE", "/proc/net/arp")
@@ -72,8 +77,10 @@ def main():
     try:
         names = sorted(os.listdir(HOSTS_DIR))
     except FileNotFoundError:
+        log.debug("нет папки %s - чистить нечего", HOSTS_DIR)
         return 0
     seen = online_macs()
+    kept = forgot = 0
     for name in names:
         if not name.endswith(".json"):
             continue
@@ -82,21 +89,27 @@ def main():
             with open(path) as f:
                 host = json.load(f)
             mac = host["mac"].lower()
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError) as ex:
+            log.warning("пропуск %s: %s", path, ex)
             continue
         last = max(host.get(k, 0) for k in ("last_online", "last_seen", "first_seen"))
         if mac not in seen and now - last > MAX_AGE and host.get("ip"):
             ping(host["ip"])
             seen = online_macs()
+            log.debug("%s %s: давно не было, пинг - %s", mac, host["ip"], "ответил" if mac in seen else "нет ответа")
         if mac in seen:
+            kept += 1
             if not dry:
                 host["last_online"] = now
                 save(path, host)
         elif now - last > MAX_AGE:
-            print("%s %s %s last active %s" % ("would forget" if dry else "forgot", mac, host.get("ip", ""),
-                                               time.strftime("%F %T", time.localtime(last))))
+            forgot += 1
+            log.info("%s %s %s (%s), последний раз %s", "забыл бы (--dry-run)" if dry else "забыт", mac,
+                     host.get("ip", ""), host.get("hostname") or host.get("supplied_hostname") or "-",
+                     time.strftime("%F %T", time.localtime(last)))
             if not dry:
                 os.remove(path)
+    log.debug("чистка: клиентов %d, в сети %d, забыто %d", len(names), kept, forgot)
     return 0
 
 

@@ -1,29 +1,57 @@
 #!/usr/bin/env python3
 # dhcp-script для dnsmasq: запоминает данные клиента (vendor class, когда впервые/последний раз) для web-dhcp.
 # Каталог - DASH_HOSTS_DIR из .env рядом со скриптом (старое имя - config.env).
-import json, os, sys, time
+# Лог (уровень DASH_LOG_LEVEL): <INSTALL_LOG_DIR>/<INSTALL_SERVICE>-hook.log, без папки логов - stderr (его пишет dnsmasq).
+import json, logging, os, sys, time
 if len(sys.argv) < 4 or sys.argv[1] not in ("add", "old", "del"):
     sys.exit(0)
 action, mac, ip = sys.argv[1:4]
-d = "/var/lib/web-dhcp/hosts"
+conf = {"DASH_HOSTS_DIR": "/var/lib/web-dhcp/hosts", "DASH_LOG_LEVEL": "INFO", "INSTALL_SERVICE": "web-dhcp"}
 for name in (".env", "config.env"):
     try:
         with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), name), encoding="utf-8") as f:
             for line in f:
                 k, _, v = line.strip().partition("=")
-                if k.strip() == "DASH_HOSTS_DIR" and v.strip():
-                    d = v.strip()
+                if k.strip() in ("DASH_HOSTS_DIR", "DASH_LOG_LEVEL", "INSTALL_LOG_DIR", "INSTALL_SERVICE") and v.strip():
+                    conf[k.strip()] = v.strip()
         break
     except OSError:
         continue
+d = conf["DASH_HOSTS_DIR"]
+
+# лог: хук не должен падать из-за него
+lvl = logging.getLevelName(conf["DASH_LOG_LEVEL"].upper())
+log = logging.getLogger("pxe-dhcp-hook")
+log.setLevel(lvl if isinstance(lvl, int) else logging.INFO)
+handler = None
+ld = conf.get("INSTALL_LOG_DIR", "")
+if ld and ld != "journal" and os.path.isdir(ld):
+    try:
+        handler = logging.FileHandler(os.path.join(ld, conf["INSTALL_SERVICE"] + "-hook.log"), encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    except OSError:
+        handler = None
+if handler is None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+log.addHandler(handler)
+
+
+def kind(vc):
+    return "PXE boot" if vc.startswith("PXEClient") else "OS"
+
+
 os.makedirs(d, exist_ok=True)
 path = os.path.join(d, mac.replace(":", "") + ".json")
+new = False
 try:
     with open(path) as f:
         h = json.load(f)
 except Exception:
     h = {"mac": mac, "first_seen": int(time.time())}
+    new = True
 e = os.environ
+old_ip, old_vc = h.get("ip", ""), h.get("vendor_class", "")
 h.update(ip=ip, last_seen=int(time.time()), last_action=action)
 if len(sys.argv) > 4 and sys.argv[4]:
     h["hostname"] = sys.argv[4]
@@ -33,9 +61,26 @@ for k, v in (("vendor_class", "DNSMASQ_VENDOR_CLASS"), ("supplied_hostname", "DN
         h[k] = e[v]
 # Настоящий запрос клиента (не перечитывание файла аренд при старте dnsmasq и не del): без vendor class -
 # стираем старый, иначе после загрузки по PXE машина в ОС так и числилась бы «PXE boot».
-if action != "del" and (e.get("DNSMASQ_TAGS") or e.get("DNSMASQ_REQUESTED_OPTIONS")) and not e.get("DNSMASQ_VENDOR_CLASS"):
+real = bool(e.get("DNSMASQ_TAGS") or e.get("DNSMASQ_REQUESTED_OPTIONS"))
+if action != "del" and real and not e.get("DNSMASQ_VENDOR_CLASS"):
     h.pop("vendor_class", None)
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(h, f)
 os.replace(tmp, path)
+
+try:
+    vc = h.get("vendor_class", "")
+    who = "%s %s (%s)" % (mac, ip, h.get("hostname") or h.get("supplied_hostname") or "-")
+    log.debug("%s %s, vendor class «%s», теги %s", action, who, vc, e.get("DNSMASQ_TAGS", "-"))
+    if new and action != "del":
+        log.info("новый клиент %s, %s, vendor class «%s»", who, kind(vc), vc)
+    elif action == "del":
+        log.info("аренда освобождена: %s", who)
+    else:
+        if old_ip and old_ip != ip:
+            log.info("%s: сменил адрес %s -> %s", who, old_ip, ip)
+        if real and kind(old_vc) != kind(vc):
+            log.info("%s: %s -> %s (vendor class «%s»)", who, kind(old_vc), kind(vc), vc)
+except Exception:
+    pass

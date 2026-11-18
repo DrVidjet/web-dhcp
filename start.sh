@@ -151,11 +151,12 @@ PUNIT=/etc/systemd/system/$SERVICE-prune.service
 PTIMER=/etc/systemd/system/$SERVICE-prune.timer
 DNSCONF=/etc/dnsmasq.d/$SERVICE.conf
 HOOKCONF=/etc/dnsmasq.d/$SERVICE-hook.conf
+LOGROT=/etc/logrotate.d/$SERVICE
 
 if [ "$UNINSTALL" = 1 ]; then
   say "Удаление $SERVICE"
   systemctl disable --now "$SERVICE" "$SERVICE-prune.timer" 2>/dev/null || true
-  rm -f "$UNIT" "$PUNIT" "$PTIMER"
+  rm -f "$UNIT" "$PUNIT" "$PTIMER" "$LOGROT"
   if [ -f "$DNSCONF" ] || [ -f "$HOOKCONF" ]; then
     rm -f "$DNSCONF" "$HOOKCONF"; systemctl restart dnsmasq 2>/dev/null || true
     echo "убраны $DNSCONF $HOOKCONF (DHCP этой установки выключен)"
@@ -175,7 +176,7 @@ if [ "$UNINSTALL" = 1 ]; then
     ip addr del "$A" dev "$IF" 2>/dev/null || true
   fi
   systemctl daemon-reload
-  ask_yn DEL_DIR "Удалить папку установки $INSTALL_DIR (код, venv, .env)?" y
+  ask_yn DEL_DIR "Удалить папку установки $INSTALL_DIR (код, venv, .env, логи)?" y
   [ "$DEL_DIR" = y ] && rm -rf "$INSTALL_DIR"
   echo "Готово. История клиентов (${PRE[DASH_HOSTS_DIR]:-/var/lib/$APP/hosts}) и подписи не тронуты."
   exit 0
@@ -241,10 +242,18 @@ ask DASH_SMB_PATH "Путь Samba-шары для показа (пусто — �
 ask DASH_PRUNE_HOURS "Забывать клиентов, которых не было в сети N часов (0 — никогда)" "24"
 [[ $DASH_PRUNE_HOURS =~ ^[0-9]+$ ]] || die "нужно целое число часов"
 setting DASH_PROBE_INTERVAL 60
+setting DASH_LOG_LEVEL INFO
+DASH_LOG_LEVEL=${DASH_LOG_LEVEL^^}
+case $DASH_LOG_LEVEL in ERROR|WARNING|INFO|DEBUG) ;; *) warn "DASH_LOG_LEVEL=$DASH_LOG_LEVEL - нет такого уровня, будет INFO"; DASH_LOG_LEVEL=INFO ;; esac
+# логи служб: папка (по умолчанию <папка установки>/log) или journal - только журнал systemd
+setting INSTALL_LOG_DIR "$INSTALL_DIR/log"
+INSTALL_LOG_DIR=${INSTALL_LOG_DIR%/}
+[ -z "$INSTALL_LOG_DIR" ] && INSTALL_LOG_DIR=journal
 
 # ---------------------------------------------------------------- установка
 need_pkgs python3 python3-venv iputils-ping iproute2
 [ "$INSTALL_DHCP" = y ] && need_pkgs dnsmasq
+[ "$INSTALL_LOG_DIR" != journal ] && need_pkgs logrotate
 
 say "Файлы в $INSTALL_DIR"
 install -d -m 755 "$INSTALL_DIR" "$DASH_HOSTS_DIR"
@@ -256,10 +265,10 @@ cfg=$INSTALL_DIR/.env
 {
   echo "# $APP: настройки (создано start.sh $(date '+%F %T')). После правки: systemctl restart $SERVICE"
   for k in DASH_PORT DASH_BIND DASH_IFACE DASH_LEASES DASH_HOSTS_DIR DASH_TITLE DASH_SERVER_ADDR DASH_IPMI_URL \
-           DASH_IVENTOY_PORT DASH_SHARE_URL DASH_SMB_PATH DASH_PRUNE_HOURS DASH_PROBE_INTERVAL; do echo "$k=${!k}"; done
-  echo "# для start.sh (приложение не читает)"
+           DASH_IVENTOY_PORT DASH_SHARE_URL DASH_SMB_PATH DASH_PRUNE_HOURS DASH_PROBE_INTERVAL DASH_LOG_LEVEL; do echo "$k=${!k}"; done
+  echo "# для start.sh (программа не читает; хук dnsmasq берёт отсюда INSTALL_LOG_DIR и INSTALL_SERVICE - куда писать лог)"
   for k in INSTALL_SERVICE INSTALL_DHCP INSTALL_DHCP_ADDR INSTALL_DHCP_START INSTALL_DHCP_END INSTALL_DHCP_LEASE \
-           INSTALL_DHCP_GATEWAY INSTALL_DHCP_DNS INSTALL_DHCP_PXE; do echo "$k=${!k-}"; done
+           INSTALL_DHCP_GATEWAY INSTALL_DHCP_DNS INSTALL_DHCP_PXE INSTALL_LOG_DIR; do echo "$k=${!k-}"; done
 } > "$cfg.tmp"
 chmod 644 "$cfg.tmp"; mv "$cfg.tmp" "$cfg"
 rm -f "$INSTALL_DIR/config.env"
@@ -342,6 +351,33 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------- логи
+# вывод служб - в файлы $INSTALL_LOG_DIR (systemd дописывает их сам), ротация - logrotate (copytruncate);
+# под маску *.log попадает всё в папке, например лог dnsmasq, если log-facility указан туда
+log_unit() { :; }   # log_unit имя -> строки для [Service]
+if [ "$INSTALL_LOG_DIR" != journal ]; then
+  install -d -m 755 "$INSTALL_LOG_DIR"
+  log_unit() { printf 'Environment=PYTHONUNBUFFERED=1\nStandardOutput=append:%s/%s.log\nStandardError=inherit' "$INSTALL_LOG_DIR" "$1"; }
+  cat > "$LOGROT" <<ROT_END
+# $APP (создано start.sh)
+$INSTALL_LOG_DIR/*.log {
+    weekly
+    maxsize 20M
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ROT_END
+  chmod 644 "$LOGROT"
+  echo "логи: $INSTALL_LOG_DIR (ротация - $LOGROT)"
+else
+  rm -f "$LOGROT"
+  echo "логи: journalctl -u $SERVICE"
+fi
+
 # ---------------------------------------------------------------- systemd
 say "Службы"
 cat > "$UNIT" <<UNIT_END
@@ -358,6 +394,7 @@ DynamicUser=yes
 StateDirectory=$SERVICE-labels
 Restart=on-failure
 RestartSec=5
+$(log_unit "$SERVICE")
 
 [Install]
 WantedBy=multi-user.target
@@ -374,6 +411,7 @@ Description=$APP: forget DHCP clients offline for more than $DASH_PRUNE_HOURS h
 [Service]
 Type=oneshot
 ExecStart=$INSTALL_DIR/venv/bin/python3 -I $INSTALL_DIR/pxe-dash-prune
+$(log_unit "$SERVICE-prune")
 UNIT_END
   cat > "$PTIMER" <<UNIT_END
 # $APP (создано start.sh)
@@ -413,4 +451,8 @@ fi
 echo
 echo "Адреса:"
 for a in $(host_ips); do echo "  http://$a:$DASH_PORT/"; done
-echo "Настройки: $cfg   Логи: journalctl -u $SERVICE"
+if [ "$INSTALL_LOG_DIR" != journal ]; then
+  echo "Настройки: $cfg   Логи: $INSTALL_LOG_DIR/$SERVICE.log, $INSTALL_LOG_DIR/$SERVICE-prune.log"
+else
+  echo "Настройки: $cfg   Логи: journalctl -u $SERVICE"
+fi
